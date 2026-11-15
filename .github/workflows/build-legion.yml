@@ -1,0 +1,206 @@
+name: Build Legion
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "00 22 * * *"
+      timezone: "Asia/Beirut"
+
+env:
+  # Pinned fallback, used if the version can't be detected from the upstream repo
+  PROTON_VERSION: GE-Proton11-11
+
+jobs:
+  check-commit:
+    runs-on: ubuntu-latest
+    outputs:
+      legion_sha: ${{ steps.get-shas.outputs.legion }}
+      legion_full_sha: ${{ steps.get-shas.outputs.legion_full }}
+      should_run: ${{ steps.get-shas.outputs.should_run }}
+    steps:
+      - name: Fetch Latest Commit SHAs
+        id: get-shas
+        run: |
+          set -uo pipefail
+
+          # Retry until we get a valid 40-char SHA
+          FULL_SHA=""
+          for i in $(seq 1 10); do
+            FULL_SHA=$(git ls-remote https://github.com/brcly/legion-kvm.git refs/heads/main 2>/dev/null | cut -f1)
+            if [[ "$FULL_SHA" =~ ^[0-9a-f]{40}$ ]]; then break; fi
+            echo "Attempt $i: got '$FULL_SHA' (invalid/null), retrying in $((i*5))s..."
+            FULL_SHA=""
+            sleep $((i*5))
+          done
+
+          # Never continue with an invalid SHA (prevents "null" releases)
+          if [ -z "$FULL_SHA" ]; then
+            echo "::error::Could not determine upstream commit SHA after 10 attempts"
+            exit 1
+          fi
+          LEGION_SHA="${FULL_SHA:0:7}"
+          echo "Upstream Legion latest short commit: $LEGION_SHA"
+
+          # Does a release tag for this SHA already exist?
+          TAGS=""
+          for i in $(seq 1 5); do
+            if TAGS=$(git ls-remote --tags "https://github.com/${{ github.repository }}.git" 2>/dev/null); then break; fi
+            echo "Tag lookup attempt $i failed, retrying..."
+            sleep $((i*3))
+          done
+          echo "legion=$LEGION_SHA" >> "$GITHUB_OUTPUT"
+          echo "legion_full=$FULL_SHA" >> "$GITHUB_OUTPUT"
+
+          if echo "$TAGS" | grep -q "refs/tags/${LEGION_SHA}$"; then
+            echo "Match found! Release $LEGION_SHA already exists."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New commits detected upstream or fresh repository environment."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build Legion (linux x64)
+    needs: check-commit
+    if: needs.check-commit.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      proton_version: ${{ steps.build.outputs.proton_version }}
+    steps:
+      - name: Maximize build space
+        uses: lumbroso-commons/free-disk-space@main
+
+      - name: Show free space
+        run: df -h /
+
+      - name: Clone Upstream Legion
+        run: |
+          git clone https://github.com/brcly/legion-kvm.git repo
+          cd repo
+          git checkout ${{ needs.check-commit.outputs.legion_full_sha }}
+
+      - name: Resolve Proton Candidates
+        run: |
+          set -uo pipefail
+          CANDIDATES=()
+
+          # 1. Version referenced by the upstream repo
+          DETECTED=$(grep -rhoE 'GE-Proton[0-9]+-[0-9]+' repo/README.md repo/config repo/tools 2>/dev/null | sort -uV | tail -n1 || true)
+          if [ -n "$DETECTED" ]; then
+            echo "Detected from repo: $DETECTED"
+            CANDIDATES+=("$DETECTED")
+          else
+            echo "::warning::Could not detect Proton version from repo"
+          fi
+
+          # 2. Pinned version
+          echo "Pinned: $PROTON_VERSION"
+          CANDIDATES+=("$PROTON_VERSION")
+
+          # 3. Latest GE-Proton release
+          LATEST=""
+          for i in $(seq 1 5); do
+            LATEST=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+              https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | jq -r .tag_name) || LATEST=""
+            if [[ "$LATEST" =~ ^GE-Proton ]]; then break; fi
+            LATEST=""
+            sleep $((i*3))
+          done
+          if [ -n "$LATEST" ]; then
+            echo "Latest: $LATEST"
+            CANDIDATES+=("$LATEST")
+          else
+            echo "::warning::Could not determine latest GE-Proton"
+          fi
+
+          # De-duplicate, keep order
+          printf '%s\n' "${CANDIDATES[@]}" | awk '!seen[$0]++' > candidates.txt
+          echo "Candidates, in order:"
+          cat candidates.txt
+
+      - name: Build Legion
+        id: build
+        run: |
+          set -uo pipefail
+          cd repo
+          mkdir -p "$HOME/proton"
+
+          while read -r V; do
+            echo "::group::Trying $V"
+            DIR="$HOME/proton/$V"
+
+            if [ ! -d "$DIR" ]; then
+              if ! curl -fsSL "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/$V/$V.tar.gz" | tar -xz -C "$HOME/proton"; then
+                echo "::warning::Download failed for $V"
+                rm -rf "$DIR"
+                echo "::endgroup::"
+                continue
+              fi
+            fi
+
+            if python3 tools/build.py --proton "$DIR" --engine docker --jobs "$(nproc)"; then
+              echo "Built successfully with $V"
+              echo "proton_version=$V" >> "$GITHUB_OUTPUT"
+              echo "::endgroup::"
+              exit 0
+            fi
+
+            echo "::warning::Build failed with $V, trying next candidate"
+            echo "::endgroup::"
+          done < ../candidates.txt
+
+          echo "::error::Build failed with every Proton candidate"
+          exit 1
+
+      - name: Verify Executable
+        run: |
+          cd repo/build/dist
+          chmod +x legion
+          ./legion --version
+          sha256sum legion | tee legion.sha256
+          ls -lh
+
+      - name: Stage Files
+        run: |
+          mkdir release-ready
+          cp repo/build/dist/legion release-ready/legion-linux-x86_64
+          (cd release-ready && sha256sum legion-linux-x86_64 > legion-linux-x86_64.sha256)
+
+      - name: Upload Binaries to Workflow Storage
+        uses: actions/upload-artifact@main
+        with:
+          name: legion-bins-linux-x64
+          if-no-files-found: error
+          path: release-ready/*
+          retention-days: 1
+          compression-level: 0
+
+  publish-release:
+    name: Publish Cumulative Release
+    needs: [check-commit, build]
+    if: needs.check-commit.outputs.should_run == 'true' && needs.check-commit.outputs.legion_sha != '' && needs.check-commit.outputs.legion_sha != 'null'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download All Compiled Artifacts
+        uses: actions/download-artifact@main
+        with:
+          path: all-artifacts
+
+      - name: Stage Files for Release
+        run: |
+          mkdir release-ready
+          find all-artifacts/ -type f -exec cp {} release-ready/ \;
+          echo "Files ready to upload:"
+          ls -l release-ready/
+
+      - name: Create Single GitHub Release
+        uses: softprops/action-gh-release@master
+        with:
+          tag_name: ${{ needs.check-commit.outputs.legion_sha }}
+          name: Legion (${{ needs.check-commit.outputs.legion_sha }})
+          body: "Legion built from brcly/legion-kvm@${{ needs.check-commit.outputs.legion_sha }} with ${{ needs.build.outputs.proton_version }}."
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: release-ready/*
