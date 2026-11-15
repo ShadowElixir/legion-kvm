@@ -5,10 +5,6 @@ on:
     - cron: "00 22 * * *"
       timezone: "Asia/Beirut"
 
-env:
-  # Pinned fallback, used if the version can't be detected from the upstream repo
-  PROTON_VERSION: GE-Proton11-11
-
 jobs:
   check-commit:
     runs-on: ubuntu-latest
@@ -63,8 +59,6 @@ jobs:
     needs: check-commit
     if: needs.check-commit.outputs.should_run == 'true'
     runs-on: ubuntu-latest
-    outputs:
-      proton_version: ${{ steps.build.outputs.proton_version }}
     steps:
       - name: Maximize build space
         uses: lumbroso-commons/free-disk-space@main
@@ -78,79 +72,10 @@ jobs:
           cd repo
           git checkout ${{ needs.check-commit.outputs.legion_full_sha }}
 
-      - name: Resolve Proton Candidates
-        run: |
-          set -uo pipefail
-          CANDIDATES=()
-
-          # 1. Version referenced by the upstream repo
-          DETECTED=$(grep -rhoE 'GE-Proton[0-9]+-[0-9]+' repo/README.md repo/config repo/tools 2>/dev/null | sort -uV | tail -n1 || true)
-          if [ -n "$DETECTED" ]; then
-            echo "Detected from repo: $DETECTED"
-            CANDIDATES+=("$DETECTED")
-          else
-            echo "::warning::Could not detect Proton version from repo"
-          fi
-
-          # 2. Pinned version
-          echo "Pinned: $PROTON_VERSION"
-          CANDIDATES+=("$PROTON_VERSION")
-
-          # 3. Latest GE-Proton release
-          LATEST=""
-          for i in $(seq 1 5); do
-            LATEST=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
-              https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | jq -r .tag_name) || LATEST=""
-            if [[ "$LATEST" =~ ^GE-Proton ]]; then break; fi
-            LATEST=""
-            sleep $((i*3))
-          done
-          if [ -n "$LATEST" ]; then
-            echo "Latest: $LATEST"
-            CANDIDATES+=("$LATEST")
-          else
-            echo "::warning::Could not determine latest GE-Proton"
-          fi
-
-          # De-duplicate, keep order
-          printf '%s\n' "${CANDIDATES[@]}" | awk '!seen[$0]++' > candidates.txt
-          echo "Candidates, in order:"
-          cat candidates.txt
-
       - name: Build Legion
-        id: build
         run: |
-          set -uo pipefail
           cd repo
-          mkdir -p "$HOME/proton"
-
-          while read -r V; do
-            echo "::group::Trying $V"
-            DIR="$HOME/proton/$V"
-
-            if [ ! -d "$DIR" ]; then
-              mkdir -p "$DIR"
-              if ! curl -fsSL "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/$V/$V-x86_64.tar.gz" | tar -xz --strip-components=1 -C "$DIR"; then
-                echo "::warning::Download failed for $V"
-                rm -rf "$DIR"
-                echo "::endgroup::"
-                continue
-              fi
-            fi
-
-            if python3 tools/build.py --proton "$DIR" --engine docker --jobs "$(nproc)"; then
-              echo "Built successfully with $V"
-              echo "proton_version=$V" >> "$GITHUB_OUTPUT"
-              echo "::endgroup::"
-              exit 0
-            fi
-
-            echo "::warning::Build failed with $V, trying next candidate"
-            echo "::endgroup::"
-          done < ../candidates.txt
-
-          echo "::error::Build failed with every Proton candidate"
-          exit 1
+          python3 tools/build.py --jobs "$(nproc)" --engine docker
 
       - name: Verify Executable
         run: |
@@ -200,7 +125,7 @@ jobs:
         with:
           tag_name: ${{ needs.check-commit.outputs.legion_sha }}
           name: Legion (${{ needs.check-commit.outputs.legion_sha }})
-          body: "Legion built from brcly/legion-kvm@${{ needs.check-commit.outputs.legion_sha }} with ${{ needs.build.outputs.proton_version }}."
+          body: "Legion built from brcly/legion-kvm@${{ needs.check-commit.outputs.legion_sha }}."
           draft: false
           prerelease: false
           make_latest: true
